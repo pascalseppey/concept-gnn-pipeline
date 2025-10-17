@@ -4,19 +4,21 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
-import json
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
+import yaml
 from tqdm import tqdm
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.append(str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from src.bijective_pipeline import Command, EFFECTS  # type: ignore
 from src.metrics import compute_patch_features, summarize_metrics  # type: ignore
@@ -40,17 +42,21 @@ def apply_commands(mat: np.ndarray, commands: Iterable[Command]) -> np.ndarray:
     return out
 
 
-def enumerate_sequence_pool() -> List[List[Command]]:
+def enumerate_sequence_pool(config: Dict[str, Iterable[int]] | None = None) -> List[List[Command]]:
+    cfg = config or {}
+    roll_shifts = cfg.get("roll_shifts", [-64, -32, 0, 32, 64])
+    xor_seeds = cfg.get("xor_seeds", [11, 29, 47, 83])
+    perm_rows_seeds = cfg.get("perm_rows_seeds", [3, 7, 13, 19])
+    perm_cols_seeds = cfg.get("perm_cols_seeds", [5, 17, 23, 31])
+    block_sizes = cfg.get("block_sizes", [8, 16, 32, 64])
+    block_seeds = cfg.get("block_seeds", [2, 5, 11])
+
     pool: List[List[Command]] = [[]]
-    roll_params = [Command("roll", {"axis": axis, "shift": shift}) for axis in (0, 1) for shift in (-64, -32, 0, 32, 64)]
-    xor_params = [Command("xor_mask", {"seed": seed}) for seed in (11, 29, 47, 83)]
-    perm_rows = [Command("permute_rows", {"seed": seed}) for seed in (3, 7, 13, 19)]
-    perm_cols = [Command("permute_cols", {"seed": seed}) for seed in (5, 17, 23, 31)]
-    block_params = [
-        Command("block_shuffle", {"block": block, "seed": seed})
-        for block in (8, 16, 32, 64)
-        for seed in (2, 5, 11)
-    ]
+    roll_params = [Command("roll", {"axis": axis, "shift": shift}) for axis in (0, 1) for shift in roll_shifts]
+    xor_params = [Command("xor_mask", {"seed": seed}) for seed in xor_seeds]
+    perm_rows = [Command("permute_rows", {"seed": seed}) for seed in perm_rows_seeds]
+    perm_cols = [Command("permute_cols", {"seed": seed}) for seed in perm_cols_seeds]
+    block_params = [Command("block_shuffle", {"block": block, "seed": seed}) for block in block_sizes for seed in block_seeds]
     single = roll_params + xor_params + perm_rows + perm_cols + block_params
     pool.extend([[cmd] for cmd in single])
 
@@ -89,6 +95,7 @@ def metric_bins(metrics: Dict[str, float], bin_config: Dict[str, List[float]]) -
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate dataset with metric coverage.")
+    parser.add_argument("--config", type=Path, default=None, help="YAML configuration file")
     parser.add_argument("--output", type=Path, default=Path("analysis/dataset.jsonl"), help="Output JSONL file")
     parser.add_argument("--max-samples", type=int, default=2000, help="Total samples to keep")
     parser.add_argument("--patch-variant", choices=["spectral", "correlation", "hybrid"], default="spectral")
@@ -96,8 +103,25 @@ def main() -> None:
     parser.add_argument("--min-per-bin", type=int, default=3, help="Minimum samples per bin before rejecting")
     args = parser.parse_args()
 
+    cfg: Dict[str, Iterable[int]] = {}
+    if args.config is not None:
+        with args.config.open() as f:
+            raw_cfg = yaml.safe_load(f) or {}
+        args.max_samples = raw_cfg.get("max_samples", args.max_samples)
+        args.coverage_threshold = raw_cfg.get("coverage_threshold", args.coverage_threshold)
+        args.min_per_bin = raw_cfg.get("min_per_bin", args.min_per_bin)
+        args.patch_variant = raw_cfg.get("patch_variant", args.patch_variant)
+        cfg = {
+            "roll_shifts": raw_cfg.get("roll_shifts"),
+            "xor_seeds": raw_cfg.get("xor_seeds"),
+            "perm_rows_seeds": raw_cfg.get("perm_rows_seeds"),
+            "perm_cols_seeds": raw_cfg.get("perm_cols_seeds"),
+            "block_sizes": raw_cfg.get("block_sizes"),
+            "block_seeds": raw_cfg.get("block_seeds"),
+        }
+
     base = alternating_columns((MATRIX_SIZE, MATRIX_SIZE))
-    sequences = enumerate_sequence_pool()
+    sequences = enumerate_sequence_pool(cfg)
 
     # bins for key metrics
     bin_config = {

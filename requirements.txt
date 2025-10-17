@@ -11,3 +11,4 @@ seaborn
 tqdm
 pyarrow
 pytest
+PyYAML
