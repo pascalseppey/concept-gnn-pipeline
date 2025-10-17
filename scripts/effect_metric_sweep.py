@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
 import numpy as np
+from tqdm import tqdm
 
 from src.bijective_pipeline import Command, EFFECTS  # type: ignore
 
@@ -245,7 +246,8 @@ def main() -> None:
     ]
 
     rows = []
-    for idx, commands in enumerate(sequences):
+    iterator = tqdm(enumerate(sequences), total=len(sequences), desc="Sweeping effects")
+    for idx, commands in iterator:
         transformed = apply_commands(base, commands)
         metrics = compute_metrics(base, transformed, commands)
         row = {"sequence_id": idx, "command_signature": repr([{"name": cmd.name, **cmd.params} for cmd in commands])}

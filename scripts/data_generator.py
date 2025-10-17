@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
+from tqdm import tqdm
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,7 +113,8 @@ def main() -> None:
     kept = 0
 
     with args.output.open("w") as f:
-        for seq_id, commands in enumerate(sequences):
+        iterator = tqdm(enumerate(sequences), total=len(sequences), desc="Generating dataset")
+        for seq_id, commands in iterator:
             transformed = apply_commands(base, commands)
             metrics = summarize_metrics(transformed, base)
             bin_id = metric_bins(metrics, bin_config)

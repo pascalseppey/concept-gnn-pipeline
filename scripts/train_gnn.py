@@ -16,6 +16,7 @@ from torch import nn
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import TransformerConv, global_mean_pool
+from tqdm import tqdm
 
 
 def load_dataset(path: Path) -> Tuple[List[Data], Dict[str, int]]:
@@ -160,7 +161,8 @@ def main() -> None:
             model.train()
             total_loss = 0.0
             total_graphs = 0
-            for batch in train_loader:
+            progress = tqdm(train_loader, desc=f"Epoch {epoch:02d}", leave=False)
+            for batch in progress:
                 batch = batch.to(device)
                 optimizer.zero_grad()
                 logits = model(batch)
@@ -169,6 +171,7 @@ def main() -> None:
                 optimizer.step()
                 total_loss += loss.item() * batch.num_graphs
                 total_graphs += batch.num_graphs
+                progress.set_postfix(loss=loss.item())
             avg_loss = total_loss / max(total_graphs, 1)
             train_acc = evaluate(model, train_loader, device)
             val_acc = evaluate(model, valid_loader, device)
