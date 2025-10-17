@@ -1,0 +1,10 @@
+dataset: analysis/train_dataset.jsonl
+log_dir: data/logs/run_default
+batch_size: 64
+epochs: 30
+learning_rate: 0.0003
+weight_decay: 0.0001
+checkpoint_every: 5
+model:
+  hidden_channels: 256
+  heads: 4

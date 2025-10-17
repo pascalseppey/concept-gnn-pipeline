@@ -1,0 +1,13 @@
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
+torch-geometric==2.4.0
+numpy
+scipy
+scikit-image
+pandas
+matplotlib
+seaborn
+tqdm
+pyarrow
+pytest
