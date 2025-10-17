@@ -15,6 +15,11 @@ from torch_geometric.loader import DataLoader
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
+
 from scripts.train_gnn import FusionGNN, load_dataset  # type: ignore
 
 
