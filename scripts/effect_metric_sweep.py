@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import math
+import argparse
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -218,13 +219,30 @@ def compute_metrics(base: np.ndarray, transformed: np.ndarray, commands: Sequenc
     return metrics
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Sweep effect chains and log metrics.")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("analysis/effect_metric_sweep.csv"),
+        help="Chemin du CSV de sortie (créera les dossiers).",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Optionnel : réservé pour compatibilité (pas utilisé pour l'instant).",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     base = alternating_columns((MATRIX_SIZE, MATRIX_SIZE))
     sequences = enumerate_sequences()
 
-    output_path = Path("analysis")
-    output_path.mkdir(exist_ok=True)
-    csv_path = output_path / "effect_metric_sweep.csv"
+    csv_path = args.output
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     fieldnames = [
         "sequence_id",
