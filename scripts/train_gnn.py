@@ -6,12 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+import yaml
 from torch import nn
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
@@ -131,7 +132,8 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> floa
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train GNN with metric-aware dataset.")
-    parser.add_argument("--dataset", type=Path, required=True, help="Path to dataset JSONL")
+    parser.add_argument("--config", type=Path, default=None, help="Optional YAML configuration file")
+    parser.add_argument("--dataset", type=Path, default=None, help="Path to dataset JSONL")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -139,6 +141,22 @@ def main() -> None:
     parser.add_argument("--checkpoint-every", type=int, default=5, help="Epoch interval for saving checkpoints")
     parser.add_argument("--log-dir", type=Path, default=Path("analysis/train_logs"))
     args = parser.parse_args()
+
+    if args.config is not None:
+        with args.config.open() as f:
+            cfg = yaml.safe_load(f) or {}
+        if args.dataset is None:
+            args.dataset = Path(cfg.get("dataset", "")) if cfg.get("dataset") else None
+        args.epochs = cfg.get("epochs", args.epochs)
+        args.batch_size = cfg.get("batch_size", args.batch_size)
+        args.lr = cfg.get("learning_rate", args.lr)
+        args.weight_decay = cfg.get("weight_decay", args.weight_decay)
+        args.checkpoint_every = cfg.get("checkpoint_every", args.checkpoint_every)
+        if cfg.get("log_dir"):
+            args.log_dir = Path(cfg["log_dir"])
+
+    if args.dataset is None:
+        parser.error("--dataset must be specified either via CLI or config file")
 
     args.log_dir.mkdir(parents=True, exist_ok=True)
     samples, command_map = load_dataset(args.dataset)
