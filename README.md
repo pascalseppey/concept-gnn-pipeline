@@ -35,7 +35,14 @@ concept-gnn-pipeline/
 
 ## Workflow
 1. **Balayage métrique** : `python scripts/effect_metric_sweep.py --config config/bins.yml`.
-2. **Génération dataset** : `python scripts/generate_dataset.py --config config/generator.yml --max-samples ...`.
+2. **Génération dataset** :
+   ```bash
+   python scripts/generate_dataset.py \
+       --config config/generator.yml \
+       --num-workers 8 \
+       --output data/samples/train_dataset.jsonl
+   ```
+   (ajuste `max_samples`, `passes`, `coverage_threshold` dans `config/generator.yml`.)
 3. **Entraînement** : `python scripts/train_gnn.py --config config/train.yml --dataset ...`.
 4. **Évaluation / visualisation** : `scripts/evaluate_gnn.py`, `scripts/analyse_metrics.py`.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dataset generator that enforces metric coverage for effect chains."""
+"""Dataset generator with adaptive coverage and multi-pass support."""
 
 from __future__ import annotations
 
@@ -20,12 +20,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.bijective_pipeline import Command, EFFECTS  # type: ignore
 from src.metrics import compute_patch_features, summarize_metrics  # type: ignore
+from src.effects import EffectConfig, generate_sequence_pool  # type: ignore
 
 Shape = Tuple[int, int]
 MATRIX_SIZE = 256
-BASE_MATRIX = None  # initialisé paresseusement dans les workers
+BASE_MATRIX: np.ndarray | None = None
 
 
 def alternating_columns(shape: Shape) -> np.ndarray:
@@ -34,14 +34,17 @@ def alternating_columns(shape: Shape) -> np.ndarray:
     return np.tile(pattern, (rows, 1))
 
 
-def init_worker():
+def init_worker() -> None:
     global BASE_MATRIX
     if BASE_MATRIX is None:
         BASE_MATRIX = alternating_columns((MATRIX_SIZE, MATRIX_SIZE))
 
 
-def apply_serialized_commands(mat: np.ndarray, serialized: List[Dict[str, int]]) -> np.ndarray:
-    out = mat.copy()
+def apply_serialized_commands(serialized: List[Dict[str, int]]) -> np.ndarray:
+    from src.bijective_pipeline import Command, EFFECTS  # import local pour workers
+
+    assert BASE_MATRIX is not None
+    out = BASE_MATRIX.copy()
     for entry in serialized:
         name = entry["name"]
         params = {k: v for k, v in entry.items() if k != "name"}
@@ -49,52 +52,6 @@ def apply_serialized_commands(mat: np.ndarray, serialized: List[Dict[str, int]])
         fn, _ = EFFECTS[cmd.name]
         out = fn(out, cmd.params)
     return out
-
-
-def enumerate_sequence_pool(config: Dict[str, Iterable[int]] | None = None) -> List[List[Dict[str, int]]]:
-    cfg = config or {}
-    roll_shifts = cfg.get("roll_shifts", [-64, -32, 0, 32, 64])
-    xor_seeds = cfg.get("xor_seeds", [11, 29, 47, 83])
-    perm_rows_seeds = cfg.get("perm_rows_seeds", [3, 7, 13, 19])
-    perm_cols_seeds = cfg.get("perm_cols_seeds", [5, 17, 23, 31])
-    block_sizes = cfg.get("block_sizes", [8, 16, 32, 64])
-    block_seeds = cfg.get("block_seeds", [2, 5, 11])
-
-    pool: List[List[Dict[str, int]]] = [[]]
-
-    def serialize(cmd: Command) -> Dict[str, int]:
-        entry = {"name": cmd.name}
-        entry.update(cmd.params)
-        return entry
-
-    roll_params = [serialize(Command("roll", {"axis": axis, "shift": shift})) for axis in (0, 1) for shift in roll_shifts]
-    xor_params = [serialize(Command("xor_mask", {"seed": seed})) for seed in xor_seeds]
-    perm_rows = [serialize(Command("permute_rows", {"seed": seed})) for seed in perm_rows_seeds]
-    perm_cols = [serialize(Command("permute_cols", {"seed": seed})) for seed in perm_cols_seeds]
-    block_params = [serialize(Command("block_shuffle", {"block": block, "seed": seed})) for block in block_sizes for seed in block_seeds]
-
-    single = roll_params + xor_params + perm_rows + perm_cols + block_params
-    pool.extend([[cmd] for cmd in single])
-
-    def product(a: Sequence[Dict[str, int]], b: Sequence[Dict[str, int]]) -> Iterable[List[Dict[str, int]]]:
-        for cmd1 in a:
-            for cmd2 in b:
-                yield [cmd1, cmd2]
-
-    pair_sets = [roll_params, xor_params, perm_rows, perm_cols, block_params]
-    for first in pair_sets:
-        for second in pair_sets:
-            pool.extend(product(first, second))
-
-    for cmd1 in roll_params[:3]:
-        for cmd2 in perm_rows[:3]:
-            for cmd3 in block_params[:3]:
-                pool.append([cmd1, cmd2, cmd3])
-    for cmd1 in xor_params[:3]:
-        for cmd2 in perm_cols[:3]:
-            for cmd3 in block_params[:3]:
-                pool.append([cmd1, cmd2, cmd3])
-    return pool
 
 
 def metric_bins(metrics: Dict[str, float], bin_config: Dict[str, List[float]]) -> Tuple[int, ...]:
@@ -108,11 +65,20 @@ def metric_bins(metrics: Dict[str, float], bin_config: Dict[str, List[float]]) -
     return tuple(coords)
 
 
-def compute_metrics_task(args: Tuple[int, List[Dict[str, int]]]) -> Tuple[int, List[Dict[str, int]], Dict[str, float]]:
-    index, serialized = args
-    mat = apply_serialized_commands(BASE_MATRIX, serialized)
-    metrics = summarize_metrics(mat, BASE_MATRIX)
-    return index, serialized, metrics
+def compute_metrics_task(args: Tuple[int, List[Dict[str, int]]]) -> Tuple[int, List[Dict[str, int]], Dict[str, float], np.ndarray]:
+    idx, serialized = args
+    mat = apply_serialized_commands(serialized)
+    metrics = summarize_metrics(mat, BASE_MATRIX)  # type: ignore[arg-type]
+    return idx, serialized, metrics, mat
+
+
+def adaptive_threshold(target_counts: Dict[Tuple[int, ...], int], attempts: int) -> int:
+    base_threshold = 1
+    if attempts > 3:
+        base_threshold = 2
+    if attempts > 6:
+        base_threshold = 3
+    return base_threshold
 
 
 def main() -> None:
@@ -122,11 +88,24 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=2000, help="Total samples to keep")
     parser.add_argument("--patch-variant", choices=["spectral", "correlation", "hybrid"], default="spectral")
     parser.add_argument("--coverage-threshold", type=float, default=0.3, help="Target ratio of samples reserved for coverage (0-1)")
-    parser.add_argument("--min-per-bin", type=int, default=3, help="Minimum samples per bin before rejecting")
-    parser.add_argument("--num-workers", type=int, default=1, help="Number of worker processes for metric computation")
+    parser.add_argument("--min-per-bin", type=int, default=3, help="Minimum samples per bin before rejection")
+    parser.add_argument("--num-workers", type=int, default=1, help="Number of worker processes")
+    parser.add_argument("--passes", type=int, default=1, help="Number of adaptive passes")
     args = parser.parse_args()
 
-    cfg: Dict[str, Iterable[int]] = {}
+    effect_cfg = EffectConfig(
+        roll_shifts=[-64, -32, 0, 32, 64],
+        xor_seeds=[11, 29, 47, 83],
+        perm_rows_seeds=[3, 7, 13, 19],
+        perm_cols_seeds=[5, 17, 23, 31],
+        block_sizes=[8, 16, 32, 64],
+        block_seeds=[2, 5, 11],
+    )
+
+    bin_config_path = ROOT / "config" / "bins.yml"
+    with bin_config_path.open() as f:
+        bin_config = yaml.safe_load(f)
+
     if args.config is not None:
         with args.config.open() as f:
             raw_cfg = yaml.safe_load(f) or {}
@@ -134,63 +113,66 @@ def main() -> None:
         args.coverage_threshold = raw_cfg.get("coverage_threshold", args.coverage_threshold)
         args.min_per_bin = raw_cfg.get("min_per_bin", args.min_per_bin)
         args.patch_variant = raw_cfg.get("patch_variant", args.patch_variant)
-        cfg = {
-            "roll_shifts": raw_cfg.get("roll_shifts"),
-            "xor_seeds": raw_cfg.get("xor_seeds"),
-            "perm_rows_seeds": raw_cfg.get("perm_rows_seeds"),
-            "perm_cols_seeds": raw_cfg.get("perm_cols_seeds"),
-            "block_sizes": raw_cfg.get("block_sizes"),
-            "block_seeds": raw_cfg.get("block_seeds"),
-        }
+        effect_cfg = EffectConfig(
+            roll_shifts=raw_cfg.get("roll_shifts", effect_cfg.roll_shifts),
+            xor_seeds=raw_cfg.get("xor_seeds", effect_cfg.xor_seeds),
+            perm_rows_seeds=raw_cfg.get("perm_rows_seeds", effect_cfg.perm_rows_seeds),
+            perm_cols_seeds=raw_cfg.get("perm_cols_seeds", effect_cfg.perm_cols_seeds),
+            block_sizes=raw_cfg.get("block_sizes", effect_cfg.block_sizes),
+            block_seeds=raw_cfg.get("block_seeds", effect_cfg.block_seeds),
+            max_depth=raw_cfg.get("max_depth", effect_cfg.max_depth),
+        )
 
     global BASE_MATRIX
     BASE_MATRIX = alternating_columns((MATRIX_SIZE, MATRIX_SIZE))
-    sequences = enumerate_sequence_pool(cfg)
-
-    bin_config = {
-        "binary_entropy": [0.4, 0.7, 0.9, 1.0],
-        "fft_anisotropy": [-0.5, -0.2, 0.2, 0.5, 0.8],
-        "mutual_info_local": [0.02, 0.05, 0.1, 0.2],
-        "hamming_from_base": [5000, 15000, 25000, 40000],
-    }
+    sequences = generate_sequence_pool(effect_cfg)
 
     num_bins = int(np.prod([len(v) + 1 for v in bin_config.values()]))
-    target_per_bin = max(args.min_per_bin, int(math.ceil(args.max_samples * args.coverage_threshold / num_bins)))
+    target_per_bin = max(args.min_per_bin, math.ceil(args.max_samples * args.coverage_threshold / num_bins))
+
     bin_counts: Dict[Tuple[int, ...], int] = defaultdict(int)
     kept = 0
-
-    tasks = list(enumerate(sequences))
-    results: List[Tuple[int, List[Dict[str, int]], Dict[str, float]]] = []
-
-    with ProcessPoolExecutor(max_workers=args.num_workers, initializer=init_worker) as executor:
-        iterator = tqdm(executor.map(compute_metrics_task, tasks), total=len(tasks), desc="Compute metrics")
-        for res in iterator:
-            results.append(res)
-
-    results.sort(key=lambda x: x[0])
+    passes = args.passes
 
     output_path = args.output
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with output_path.open("w") as f:
-        for seq_id, serialized, metrics in tqdm(results, desc="Selecting samples"):
-            bin_id = metric_bins(metrics, bin_config)
-            if bin_counts[bin_id] >= target_per_bin:
-                continue
-            transformed = apply_serialized_commands(BASE_MATRIX, serialized)
-            patch_features = compute_patch_features(transformed, patch_size=16, variant=args.patch_variant)
-            record = {
-                "sequence_id": seq_id,
-                "commands": serialized,
-                "metrics": metrics,
-                "patch_features": patch_features.tolist(),
-                "matrix_bits": transformed.flatten().tolist(),
-            }
-            f.write(json.dumps(record) + "\n")
-            bin_counts[bin_id] += 1
-            kept += 1
-            if kept >= args.max_samples:
-                break
+    for pass_idx in range(1, passes + 1):
+        print(f"=== Pass {pass_idx}/{passes} ===")
+        target = adaptive_threshold(bin_counts, pass_idx)
+
+        tasks = list(enumerate(sequences))
+        results: List[Tuple[int, List[Dict[str, int]], Dict[str, float], np.ndarray]] = []
+
+        with ProcessPoolExecutor(max_workers=args.num_workers, initializer=init_worker) as executor:
+            iterator = tqdm(executor.map(compute_metrics_task, tasks), total=len(tasks), desc="Compute metrics")
+            for res in iterator:
+                results.append(res)
+
+        results.sort(key=lambda x: x[0])
+
+        with output_path.open("a") as f:
+            for seq_id, serialized, metrics, mat in tqdm(results, desc="Selecting samples"):
+                bin_id = metric_bins(metrics, bin_config)
+                if bin_counts[bin_id] >= max(target_per_bin, target):
+                    continue
+                patch_features = compute_patch_features(mat, patch_size=16, variant=args.patch_variant)
+                record = {
+                    "sequence_id": seq_id,
+                    "commands": serialized,
+                    "metrics": metrics,
+                    "patch_features": patch_features.tolist(),
+                    "matrix_bits": mat.flatten().tolist(),
+                }
+                f.write(json.dumps(record) + "\n")
+                bin_counts[bin_id] += 1
+                kept += 1
+                if kept >= args.max_samples:
+                    break
+
+        if kept >= args.max_samples:
+            print("Quota global atteint")
+            break
 
     filled_bins = sum(1 for count in bin_counts.values() if count > 0)
     print(f"Wrote {kept} samples to {output_path}")

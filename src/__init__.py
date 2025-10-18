@@ -3,4 +3,5 @@
 __all__ = [
     "metrics",
     "bijective_pipeline",
+    "effects",
 ]

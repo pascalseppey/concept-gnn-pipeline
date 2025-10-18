@@ -2,10 +2,11 @@ max_samples: 50000
 coverage_threshold: 0.85
 min_per_bin: 40
 patch_variant: spectral
-# Paramètres étendus pour couvrir davantage de combinaisons
+passes: 3
 roll_shifts: [-128, -96, -64, -48, -32, -16, 0, 16, 32, 48, 64, 96, 128]
 xor_seeds: [5, 11, 17, 23, 29, 43, 47, 59, 71, 83, 97]
 perm_rows_seeds: [3, 5, 7, 9, 13, 19, 27, 33, 45]
 perm_cols_seeds: [5, 11, 17, 23, 31, 37, 41, 53, 61]
 block_sizes: [4, 8, 16, 32, 64]
 block_seeds: [2, 5, 11, 17, 23, 29]
+max_depth: 4
