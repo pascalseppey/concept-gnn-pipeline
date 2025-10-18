@@ -8,13 +8,13 @@ import json
 import math
 import sys
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import yaml
 from tqdm import tqdm
-
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -23,9 +23,9 @@ if str(ROOT) not in sys.path:
 from src.bijective_pipeline import Command, EFFECTS  # type: ignore
 from src.metrics import compute_patch_features, summarize_metrics  # type: ignore
 
-
 Shape = Tuple[int, int]
 MATRIX_SIZE = 256
+BASE_MATRIX = None  # initialisé paresseusement dans les workers
 
 
 def alternating_columns(shape: Shape) -> np.ndarray:
@@ -34,15 +34,24 @@ def alternating_columns(shape: Shape) -> np.ndarray:
     return np.tile(pattern, (rows, 1))
 
 
-def apply_commands(mat: np.ndarray, commands: Iterable[Command]) -> np.ndarray:
+def init_worker():
+    global BASE_MATRIX
+    if BASE_MATRIX is None:
+        BASE_MATRIX = alternating_columns((MATRIX_SIZE, MATRIX_SIZE))
+
+
+def apply_serialized_commands(mat: np.ndarray, serialized: List[Dict[str, int]]) -> np.ndarray:
     out = mat.copy()
-    for cmd in commands:
+    for entry in serialized:
+        name = entry["name"]
+        params = {k: v for k, v in entry.items() if k != "name"}
+        cmd = Command(name=name, params=params)
         fn, _ = EFFECTS[cmd.name]
         out = fn(out, cmd.params)
     return out
 
 
-def enumerate_sequence_pool(config: Dict[str, Iterable[int]] | None = None) -> List[List[Command]]:
+def enumerate_sequence_pool(config: Dict[str, Iterable[int]] | None = None) -> List[List[Dict[str, int]]]:
     cfg = config or {}
     roll_shifts = cfg.get("roll_shifts", [-64, -32, 0, 32, 64])
     xor_seeds = cfg.get("xor_seeds", [11, 29, 47, 83])
@@ -51,16 +60,23 @@ def enumerate_sequence_pool(config: Dict[str, Iterable[int]] | None = None) -> L
     block_sizes = cfg.get("block_sizes", [8, 16, 32, 64])
     block_seeds = cfg.get("block_seeds", [2, 5, 11])
 
-    pool: List[List[Command]] = [[]]
-    roll_params = [Command("roll", {"axis": axis, "shift": shift}) for axis in (0, 1) for shift in roll_shifts]
-    xor_params = [Command("xor_mask", {"seed": seed}) for seed in xor_seeds]
-    perm_rows = [Command("permute_rows", {"seed": seed}) for seed in perm_rows_seeds]
-    perm_cols = [Command("permute_cols", {"seed": seed}) for seed in perm_cols_seeds]
-    block_params = [Command("block_shuffle", {"block": block, "seed": seed}) for block in block_sizes for seed in block_seeds]
+    pool: List[List[Dict[str, int]]] = [[]]
+
+    def serialize(cmd: Command) -> Dict[str, int]:
+        entry = {"name": cmd.name}
+        entry.update(cmd.params)
+        return entry
+
+    roll_params = [serialize(Command("roll", {"axis": axis, "shift": shift})) for axis in (0, 1) for shift in roll_shifts]
+    xor_params = [serialize(Command("xor_mask", {"seed": seed})) for seed in xor_seeds]
+    perm_rows = [serialize(Command("permute_rows", {"seed": seed})) for seed in perm_rows_seeds]
+    perm_cols = [serialize(Command("permute_cols", {"seed": seed})) for seed in perm_cols_seeds]
+    block_params = [serialize(Command("block_shuffle", {"block": block, "seed": seed})) for block in block_sizes for seed in block_seeds]
+
     single = roll_params + xor_params + perm_rows + perm_cols + block_params
     pool.extend([[cmd] for cmd in single])
 
-    def product(a: Sequence[Command], b: Sequence[Command]) -> Iterable[List[Command]]:
+    def product(a: Sequence[Dict[str, int]], b: Sequence[Dict[str, int]]) -> Iterable[List[Dict[str, int]]]:
         for cmd1 in a:
             for cmd2 in b:
                 yield [cmd1, cmd2]
@@ -70,7 +86,6 @@ def enumerate_sequence_pool(config: Dict[str, Iterable[int]] | None = None) -> L
         for second in pair_sets:
             pool.extend(product(first, second))
 
-    # representative triples
     for cmd1 in roll_params[:3]:
         for cmd2 in perm_rows[:3]:
             for cmd3 in block_params[:3]:
@@ -93,6 +108,13 @@ def metric_bins(metrics: Dict[str, float], bin_config: Dict[str, List[float]]) -
     return tuple(coords)
 
 
+def compute_metrics_task(args: Tuple[int, List[Dict[str, int]]]) -> Tuple[int, List[Dict[str, int]], Dict[str, float]]:
+    index, serialized = args
+    mat = apply_serialized_commands(BASE_MATRIX, serialized)
+    metrics = summarize_metrics(mat, BASE_MATRIX)
+    return index, serialized, metrics
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate dataset with metric coverage.")
     parser.add_argument("--config", type=Path, default=None, help="YAML configuration file")
@@ -101,6 +123,7 @@ def main() -> None:
     parser.add_argument("--patch-variant", choices=["spectral", "correlation", "hybrid"], default="spectral")
     parser.add_argument("--coverage-threshold", type=float, default=0.3, help="Target ratio of samples reserved for coverage (0-1)")
     parser.add_argument("--min-per-bin", type=int, default=3, help="Minimum samples per bin before rejecting")
+    parser.add_argument("--num-workers", type=int, default=1, help="Number of worker processes for metric computation")
     args = parser.parse_args()
 
     cfg: Dict[str, Iterable[int]] = {}
@@ -120,10 +143,10 @@ def main() -> None:
             "block_seeds": raw_cfg.get("block_seeds"),
         }
 
-    base = alternating_columns((MATRIX_SIZE, MATRIX_SIZE))
+    global BASE_MATRIX
+    BASE_MATRIX = alternating_columns((MATRIX_SIZE, MATRIX_SIZE))
     sequences = enumerate_sequence_pool(cfg)
 
-    # bins for key metrics
     bin_config = {
         "binary_entropy": [0.4, 0.7, 0.9, 1.0],
         "fft_anisotropy": [-0.5, -0.2, 0.2, 0.5, 0.8],
@@ -136,18 +159,29 @@ def main() -> None:
     bin_counts: Dict[Tuple[int, ...], int] = defaultdict(int)
     kept = 0
 
-    with args.output.open("w") as f:
-        iterator = tqdm(enumerate(sequences), total=len(sequences), desc="Generating dataset")
-        for seq_id, commands in iterator:
-            transformed = apply_commands(base, commands)
-            metrics = summarize_metrics(transformed, base)
+    tasks = list(enumerate(sequences))
+    results: List[Tuple[int, List[Dict[str, int]], Dict[str, float]]] = []
+
+    with ProcessPoolExecutor(max_workers=args.num_workers, initializer=init_worker) as executor:
+        iterator = tqdm(executor.map(compute_metrics_task, tasks), total=len(tasks), desc="Compute metrics")
+        for res in iterator:
+            results.append(res)
+
+    results.sort(key=lambda x: x[0])
+
+    output_path = args.output
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_path.open("w") as f:
+        for seq_id, serialized, metrics in tqdm(results, desc="Selecting samples"):
             bin_id = metric_bins(metrics, bin_config)
             if bin_counts[bin_id] >= target_per_bin:
                 continue
+            transformed = apply_serialized_commands(BASE_MATRIX, serialized)
             patch_features = compute_patch_features(transformed, patch_size=16, variant=args.patch_variant)
             record = {
                 "sequence_id": seq_id,
-                "commands": [{"name": cmd.name, **cmd.params} for cmd in commands],
+                "commands": serialized,
                 "metrics": metrics,
                 "patch_features": patch_features.tolist(),
                 "matrix_bits": transformed.flatten().tolist(),
@@ -159,7 +193,7 @@ def main() -> None:
                 break
 
     filled_bins = sum(1 for count in bin_counts.values() if count > 0)
-    print(f"Wrote {kept} samples to {args.output}")
+    print(f"Wrote {kept} samples to {output_path}")
     print(f"Bins filled: {filled_bins}/{num_bins} (target per bin {target_per_bin})")
     print("Coverage summary (non-empty bins):")
     for bin_id, count in sorted(bin_counts.items()):
@@ -168,4 +202,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    init_worker()
     main()
